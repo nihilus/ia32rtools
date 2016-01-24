@@ -1,6 +1,6 @@
 /*
  * ia32rtools
- * (C) notaz, 2013,2014
+ * (C) notaz, 2013-2015
  *
  * This work is licensed under the terms of 3-clause BSD license.
  * See COPYING file in the top-level directory.
@@ -23,6 +23,9 @@
 #define IS_START(w, y) !strncmp(w, y, strlen(y))
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof(x[0]))
 
+static char **name_cache;
+static size_t name_cache_size;
+
 // non-local branch targets
 static ea_t *nonlocal_bt;
 static int nonlocal_bt_alloc;
@@ -37,11 +40,21 @@ static int idaapi init(void)
 //--------------------------------------------------------------------------
 static void idaapi term(void)
 {
+  size_t i;
+
   if (nonlocal_bt != NULL) {
     free(nonlocal_bt);
     nonlocal_bt = NULL;
   }
   nonlocal_bt_alloc = 0;
+
+  if (name_cache != NULL) {
+    for (i = 0; i < name_cache_size; i++)
+      free(name_cache[i]);
+    free(name_cache);
+    name_cache = NULL;
+  }
+  name_cache_size = 0;
 }
 
 //--------------------------------------------------------------------------
@@ -51,9 +64,12 @@ static const char *reserved_names[] = {
   "type",
   "offset",
   "aam",
+  "aas",
   "text",
   "size",
   "c",
+  "align",
+  "addr",
 };
 
 static int is_name_reserved(const char *name)
@@ -61,6 +77,29 @@ static int is_name_reserved(const char *name)
   int i;
   for (i = 0; i < ARRAY_SIZE(reserved_names); i++)
     if (strcasecmp(name, reserved_names[i]) == 0)
+      return 1;
+
+  return 0;
+}
+
+/* these tend to cause linker conflicts */
+static const char *useless_names[] = {
+  "target", "addend", "lpMem", "Locale", "lpfn",
+  "CodePage", "uNumber", "Caption", "Default", "SubKey",
+  "ValueName", "OutputString", "LibFileName", "AppName",
+  "Buffer", "ClassName", "dwProcessId", "FileName",
+  "aExp", "aLog10", "aDelete", "aFont",
+  "lpCriticalSection", "CriticalSection", "lpAddress",
+  "lpBuffer", "lpClassName", "lpName",
+  "hHeap", "hEvent", "hHandle", "hObject",
+  "hLibModule", "hInstance",
+};
+
+static int is_name_useless(const char *name)
+{
+  int i;
+  for (i = 0; i < ARRAY_SIZE(useless_names); i++)
+    if (strcasecmp(name, useless_names[i]) == 0)
       return 1;
 
   return 0;
@@ -93,11 +132,14 @@ static int is_insn_jmp(uint16 itype)
 }
 
 static void do_def_line(char *buf, size_t buf_size, const char *line,
-  ea_t ea)
+  ea_t ea, func_t *func)
 {
+  char func_name[256] = "<nf>";
+  int is_libfunc = 0;
+  int global_label;
   ea_t *ea_ret;
+  int i, len;
   char *p;
-  int len;
 
   tag_remove(line, buf, buf_size); // remove color codes
   len = strlen(buf);
@@ -113,7 +155,22 @@ static void do_def_line(char *buf, size_t buf_size, const char *line,
   if (*p == ':') {
     ea_ret = (ea_t *)bsearch(&ea, nonlocal_bt, nonlocal_bt_cnt,
       sizeof(nonlocal_bt[0]), nonlocal_bt_cmp);
-    if (ea_ret != 0) {
+    global_label = (ea_ret != NULL);
+    if (!global_label) {
+      if (func != NULL) {
+        get_func_name(ea, func_name, sizeof(func_name));
+        is_libfunc = func->flags & FUNC_LIB;
+      }
+      for (i = 0; i < get_item_size(ea); i++) {
+        xrefblk_t xb;
+        if (xb.first_to(ea + i, XREF_DATA)) {
+          if (!is_libfunc && xb.type == dr_O)
+            msg("%x: offset xref in %s\n", ea, func_name);
+          global_label = 1;
+        }
+      }
+    }
+    if (global_label) {
       if (p[1] != ' ')
         msg("no trailing blank in '%s'\n", buf);
       else
@@ -122,16 +179,91 @@ static void do_def_line(char *buf, size_t buf_size, const char *line,
   }
 }
 
+static int name_cache_cmp(const void *p1, const void *p2)
+{
+  // masm ignores case, so do we
+  return stricmp(*(char * const *)p1, *(char * const *)p2);
+}
+
+static void rebuild_name_cache(void)
+{
+  size_t i, newsize;
+  void *tmp;
+
+  // build a sorted name cache
+  newsize = get_nlist_size();
+  if (newsize > name_cache_size) {
+    tmp = realloc(name_cache, newsize * sizeof(name_cache[0]));
+    if (tmp == NULL) {
+      msg("OOM for name cache\n");
+      return;
+    }
+    name_cache = (char **)tmp;
+  }
+  for (i = 0; i < name_cache_size; i++)
+    free(name_cache[i]);
+  for (i = 0; i < newsize; i++)
+    name_cache[i] = strdup(get_nlist_name(i));
+
+  name_cache_size = newsize;
+  qsort(name_cache, name_cache_size, sizeof(name_cache[0]),
+    name_cache_cmp);
+}
+
+static void my_rename(ea_t ea, char *name)
+{
+  char buf[256];
+  char *p, **pp;
+  int n = 0;
+
+  qsnprintf(buf, sizeof(buf), "%s", name);
+  do {
+    p = buf;
+    pp = (char **)bsearch(&p, name_cache, name_cache_size,
+        sizeof(name_cache[0]), name_cache_cmp);
+    if (pp == NULL)
+      break;
+
+    qsnprintf(buf, sizeof(buf), "%s_g%d", name, n);
+    n++;
+  }
+  while (n < 100);
+
+  if (n == 100)
+    msg("rename failure? '%s'\n", name);
+
+  do_name_anyway(ea, buf);
+  rebuild_name_cache();
+}
+
+static void make_align(ea_t ea)
+{
+  ea_t tmp_ea;
+  int n;
+
+  tmp_ea = next_head(ea, inf.maxEA);
+  if ((tmp_ea & 0x03) == 0) {
+    n = calc_max_align(tmp_ea);
+    if (n > 4) // masm doesn't like more..
+      n = 4;
+    msg("%x: align %d\n", ea, 1 << n);
+    do_unknown(ea, DOUNK_SIMPLE);
+    doAlign(ea, tmp_ea - ea, n);
+  }
+}
+
 static void idaapi run(int /*arg*/)
 {
   // isEnabled(ea) // address belongs to disassembly
   // ea_t ea = get_screen_ea();
+  // extern foo;
   // foo = DecodeInstruction(ScreenEA());
   FILE *fout = NULL;
   int fout_line = 0;
   char buf[MAXSTR];
   char buf2[MAXSTR];
   const char *name;
+  const char *cp;
   struc_t *frame;
   func_t *func;
   ea_t ui_ea_block = 0, ea_size;
@@ -141,6 +273,7 @@ static void idaapi run(int /*arg*/)
   uval_t idx;
   int i, o, m, n;
   int ret;
+  char **pp;
   char *p;
 
   nonlocal_bt_cnt = 0;
@@ -158,8 +291,11 @@ static void idaapi run(int /*arg*/)
     idx = get_first_struc_idx();
   }
 
+  rebuild_name_cache();
+
   // 1st pass: walk through all funcs
-  func = get_func(inf.minEA);
+  ea = inf.minEA;
+  func = get_func(ea);
   while (func != NULL)
   {
     func_tail_iterator_t fti(func);
@@ -204,14 +340,29 @@ static void idaapi run(int /*arg*/)
           }
         }
 
-        tmp_ea = get_name_ea(ea, buf);
-        if (tmp_ea == 0 || tmp_ea == ~0)
+        p = buf;
+        pp = (char **)bsearch(&p, name_cache, name_cache_size,
+              sizeof(name_cache[0]), name_cache_cmp);
+        if (pp == NULL)
           continue;
 
-        msg("%x: from %x: renaming '%s'\n", tmp_ea, ea, buf);
-        qstrncat(buf, "_g", sizeof(buf));
-        set_name(tmp_ea, buf);
+        tmp_ea = get_name_ea(BADADDR, *pp);
+        msg("%x: renaming '%s' because of '%s' at %x\n",
+          tmp_ea, *pp, buf, ea);
+        my_rename(tmp_ea, *pp);
       }
+    }
+
+    // detect tailcalls to next func with 'jmp $+5' (offset 0)
+    if (f_area.endEA - f_area.startEA >= 5
+      && decode_insn(f_area.endEA - 5) && cmd.itype == NN_jmp
+      && cmd.Operands[0].type == o_near
+      && cmd.Operands[0].addr == f_area.endEA
+      && get_name(BADADDR, f_area.endEA, buf, sizeof(buf))
+      && get_cmt(f_area.endEA - 5, false, buf2, sizeof(buf2)) <= 0)
+    {
+      qsnprintf(buf2, sizeof(buf2), "sctpatch: jmp %s", buf);
+      set_cmt(f_area.endEA - 5, buf2, false);
     }
 
     func = get_next_func(ea);
@@ -247,14 +398,18 @@ static void idaapi run(int /*arg*/)
 
           if (cmd.Operands[o].type == o_mem) {
             tmp_ea = cmd.Operands[o].addr;
-            flags_t tmp_ea_flags = get_flags_novalue(tmp_ea);
-            // ..but base float is ok..
-            int is_flt = isDwrd(tmp_ea_flags) || isFloat(tmp_ea_flags);
-            if (!is_flt && !isUnknown(tmp_ea_flags))
+            flags_t tmp_flg = get_flags_novalue(tmp_ea);
+            buf[0] = 0;
+            if (isDouble(tmp_flg))
             {
-              buf[0] = 0;
               get_name(ea, tmp_ea, buf, sizeof(buf));
-              msg("%x: undefining %x '%s'\n", ea, tmp_ea, buf);
+              msg("%x: converting dbl %x '%s'\n", ea, tmp_ea, buf);
+              doQwrd(tmp_ea, 8);
+            }
+            if (isOwrd(tmp_flg) || isYwrd(tmp_flg) || isTbyt(tmp_flg))
+            {
+              get_name(ea, tmp_ea, buf, sizeof(buf));
+              msg("%x: undefining lrg %x '%s'\n", ea, tmp_ea, buf);
               do_unknown(tmp_ea, DOUNK_EXPAND);
             }
           }
@@ -266,15 +421,8 @@ static void idaapi run(int /*arg*/)
           && cmd.Operands[1].type == o_displ
           && cmd.Operands[1].addr == 0)
         {
-          tmp_ea = next_head(ea, inf.maxEA);
-          if ((tmp_ea & 0x03) == 0) {
-            n = calc_max_align(tmp_ea);
-            if (n > 4) // masm doesn't like more..
-              n = 4;
-            msg("%x: align %d\n", ea, 1 << n);
-            do_unknown(ea, DOUNK_SIMPLE);
-            doAlign(ea, tmp_ea - ea, n);
-          }
+          // lea eax, [eax+0]
+          make_align(ea);
         }
         else if (!isDefArg1(ea_flags)
           && cmd.Operands[1].type == o_mem // why o_mem?
@@ -294,6 +442,15 @@ static void idaapi run(int /*arg*/)
             op_hex(ea, 1);
           }
         }
+      }
+      else if (cmd.itype == NN_mov && cmd.segpref == 0x1e // 2e?
+        && cmd.Operands[0].type == o_reg
+        && cmd.Operands[1].type == o_reg
+        && cmd.Operands[0].dtyp == cmd.Operands[1].dtyp
+        && cmd.Operands[0].reg == cmd.Operands[1].reg)
+      {
+        // db 2Eh; mov eax, eax
+        make_align(ea);
       }
 
       // find non-local branches
@@ -323,8 +480,12 @@ static void idaapi run(int /*arg*/)
       }
 
       // IDA vs masm float/mmx/xmm type incompatibility
-      if (isDouble(ea_flags) || isTbyt(ea_flags)
-       || isPackReal(ea_flags))
+      if (isDouble(ea_flags))
+      {
+        msg("%x: converting double\n", ea);
+        doQwrd(ea, 8);
+      }
+      else if (isTbyt(ea_flags) || isPackReal(ea_flags))
       {
         do_undef = 1;
       }
@@ -341,7 +502,8 @@ static void idaapi run(int /*arg*/)
         do_undef = 1;
       }
       // masm doesn't understand large aligns
-      else if (isAlign(ea_flags) && ea_size > 0x10) {
+      else if (isAlign(ea_flags) && ea_size >= 0x10)
+      {
         msg("%x: undefining align %d\n", ea, ea_size);
         do_unknown(ea, DOUNK_EXPAND);
       }
@@ -355,25 +517,77 @@ static void idaapi run(int /*arg*/)
     }
   }
 
-  // check namelist for reserved names
+  // check namelist for reserved names and
+  // matching names with different case (masm ignores case)
   n = get_nlist_size();
   for (i = 0; i < n; i++) {
+    int need_rename = 0;
+
     ea = get_nlist_ea(i);
+    ea_flags = get_flags_novalue(ea);
     name = get_nlist_name(i);
     if (name == NULL) {
       msg("%x: null name?\n", ea);
       continue;
     }
 
+    qsnprintf(buf, sizeof(buf), "%s", name);
+
+    // for short names, give them a postfix to solve link dupe problem
+    if (!isCode(ea_flags) && strlen(name) <= 4) {
+      qsnprintf(buf, sizeof(buf), "%s_%06X", name, ea);
+      need_rename = 1;
+    }
+    else {
+      qsnprintf(buf2, sizeof(buf2), "%s", name);
+      if ((p = strchr(buf2, '_')))
+        *p = 0;
+      if (is_name_useless(buf2)) {
+        msg("%x: removing name '%s'\n", ea, name);
+        ret = set_name(ea, "", SN_AUTO);
+        if (ret) {
+          n = get_nlist_size();
+          i--;
+          continue;
+        }
+      }
+    }
+
+    need_rename |= is_name_reserved(name);
+    if (!need_rename) {
+      p = buf;
+      pp = (char **)bsearch(&p, name_cache, name_cache_size,
+              sizeof(name_cache[0]), name_cache_cmp);
+      if (pp != NULL) {
+        if (pp > name_cache && stricmp(pp[-1], pp[0]) == 0)
+          need_rename = 1;
+        else if (pp < name_cache + name_cache_size - 1
+          && stricmp(pp[0], pp[1]) == 0)
+        {
+          need_rename = 1;
+        }
+      }
+    }
+
     // rename vars with '?@' (funcs are ok)
     int change_qat = 0;
-    ea_flags = get_flags_novalue(ea);
-    if (!isCode(ea_flags) && strpbrk(name, "?@"))
-      change_qat = 1;
+    if (!isCode(ea_flags)) {
+      if (IS_START(name, "__imp_"))
+        need_rename = 0; /* some import */
+      else if (name[0] == '?' && strstr(name, "@@"))
+        need_rename = 0; /* c++ import */
+      else if (strchr(name, '?'))
+        change_qat = 1;
+      else if ((cp = strchr(name, '@'))) {
+        char *endp = NULL;
+        strtol(cp + 1, &endp, 10);
+        if (endp == NULL || *endp != 0)
+          change_qat = 1;
+      }
+    }
 
-    if (change_qat || is_name_reserved(name)) {
+    if (need_rename || change_qat) {
       msg("%x: renaming name '%s'\n", ea, name);
-      qsnprintf(buf, sizeof(buf), "%s_g", name);
 
       if (change_qat) {
         for (p = buf; *p != 0; p++) {
@@ -385,7 +599,7 @@ static void idaapi run(int /*arg*/)
         }
       }
 
-      set_name(ea, buf);
+      my_rename(ea, buf);
     }
   }
 
@@ -415,7 +629,7 @@ static void idaapi run(int /*arg*/)
   ln.set_place(&pl);
   n = ln.get_linecnt();
   for (i = 0; i < n - 1; i++) {
-    do_def_line(buf, sizeof(buf), ln.down(), ea);
+    do_def_line(buf, sizeof(buf), ln.down(), ea, NULL);
     if (strstr(buf, "include"))
       continue;
 
@@ -450,6 +664,8 @@ static void idaapi run(int /*arg*/)
       if (wasBreak())
         break;
     }
+
+    func = get_func(ea);
 
     segment_t *seg = getseg(ea);
     if (!seg || (seg->type != SEG_CODE && seg->type != SEG_DATA))
@@ -516,7 +732,7 @@ static void idaapi run(int /*arg*/)
 pass:
     n = ln.get_linecnt();
     for (i = pl.lnnum; i < n; i++) {
-      do_def_line(buf, sizeof(buf), ln.down(), ea);
+      do_def_line(buf, sizeof(buf), ln.down(), ea, func);
 
       char *fw;
       for (fw = buf; *fw != 0 && *fw == ' '; )
@@ -548,7 +764,9 @@ pass:
         }
       }
       else if (jmp_near) {
-        p = strchr(fw, 'j');
+        p = NULL;
+        if (fw != buf && fw[0] == 'j')
+          p = fw;
         while (p && *p != ' ')
           p++;
         while (p && *p == ' ')
@@ -556,6 +774,7 @@ pass:
         if (p != NULL) {
           memmove(p + 9, p, strlen(p) + 1);
           memcpy(p, "near ptr ", 9);
+          jmp_near = 0;
         }
       }
       if (word_imm) {
@@ -626,10 +845,10 @@ pass:
 
 //--------------------------------------------------------------------------
 
-static const char comment[] = "Generate disassembly lines for one address";
+static const char comment[] = "Generate disassembly for nasm";
 static const char help[] = "Generate asm file\n";
 static const char wanted_name[] = "Save asm";
-static const char wanted_hotkey[] = "Ctrl-F6";
+static const char wanted_hotkey[] = "Shift-S";
 
 //--------------------------------------------------------------------------
 //

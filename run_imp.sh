@@ -1,5 +1,9 @@
 #!/bin/sh
 
+# warning: i686-w64-mingw32- on Ubuntu 14.04
+# contains broken InterlockedDecrement
+test -n "$mingwb" || mingwb=i686-w64-mingw32
+
 target_s=$1
 src_asm=$2
 implist=${target_s}_implist
@@ -23,9 +27,9 @@ cat $implist | while read i; do
     ;;
   esac
 
-  grep "\<_$si\>" /usr/i586-mingw32msvc/lib/lib* "$@" | awk '{print $3}' | \
+  grep -e "\<_\?_$si\>" -e "@$si\>" /usr/$mingwb/lib/lib* "$@" | awk '{print $3}' | \
     while read f; do
-      sym=`i586-mingw32msvc-nm $f | grep "\<_$si\>" | grep ' T ' | awk '{print $3}'`
+      sym=`${mingwb}-nm $f | grep -e "\<_\?_$si\>" -e " @$si\>" | grep ' T ' | awk '{print $3}'`
       if test -n "$sym"; then
         echo $sym > $tmpsym
         break
@@ -33,8 +37,14 @@ cat $implist | while read i; do
     done
   sym=`cat $tmpsym`
   if test -z "$sym"; then
-    echo "no file/sym for $i, lf $f"
-    exit 1
+    # could be a data import
+    if test -n "$data_symf" && grep -q "$si" $data_symf; then
+      continue
+    else
+      echo "$target_s: no file/sym for $i"
+      rm $target_s
+      exit 1
+    fi
   fi
 
   echo ".globl $i" >> $target_s

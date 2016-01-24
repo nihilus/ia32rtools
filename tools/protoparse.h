@@ -15,13 +15,17 @@ struct parsed_type {
 	unsigned int is_struct:1; // split for args
 	unsigned int is_retreg:1; // register to return to caller
 	unsigned int is_va_list:1;
+	unsigned int is_64bit:1;
+	unsigned int is_float:1;  // float, double
 };
 
 struct parsed_proto_arg {
 	char *reg;
 	struct parsed_type type;
-	struct parsed_proto *fptr;
-	void *datap;
+	struct parsed_proto *pp; // fptr or struct
+	unsigned int is_saved:1; // not set here, for tool use
+	void **push_refs;
+	int push_ref_cnt;
 };
 
 struct parsed_proto {
@@ -30,7 +34,7 @@ struct parsed_proto {
 		struct parsed_type ret_type;
 		struct parsed_type type;
 	};
-	struct parsed_proto_arg arg[16];
+	struct parsed_proto_arg arg[32];
 	int argc;
 	int argc_stack;
 	int argc_reg;
@@ -39,13 +43,26 @@ struct parsed_proto {
 	unsigned int is_fastcall:1;
 	unsigned int is_vararg:1;     // vararg func
 	unsigned int is_fptr:1;
+	unsigned int is_import:1;     // data import
 	unsigned int is_noreturn:1;
 	unsigned int is_unresolved:1;
+	unsigned int is_guessed:1;    // for extra checking
 	unsigned int is_userstack:1;
-	unsigned int is_oslib:1;      // OS/system library func
+	unsigned int is_include:1;    // not from top-level header
+	unsigned int is_osinc:1;      // OS/system library func
+	unsigned int is_cinc:1;       // crt library func
 	unsigned int is_arg:1;        // declared in some func arg
 	unsigned int has_structarg:1;
 	unsigned int has_retreg:1;
+};
+
+struct parsed_struct {
+	char name[256];
+	struct {
+		int offset;
+		struct parsed_proto pp;
+	} members[64];
+	int member_count;
 };
 
 static const char *hdrfn;
@@ -54,16 +71,19 @@ static int hdrfline = 0;
 static void pp_copy_arg(struct parsed_proto_arg *d,
 	const struct parsed_proto_arg *s);
 
-static int b_pp_c_handler(char *proto, const char *fname, int is_oslib);
+static int b_pp_c_handler(char *proto, const char *fname,
+	int is_include, int is_osinc, int is_cinc);
+static int struct_handler(FILE *fhdr, char *proto, int *line);
 
-static int do_protostrs(FILE *fhdr, const char *fname)
+static int do_protostrs(FILE *fhdr, const char *fname, int is_include)
 {
 	const char *finc_name;
 	const char *hdrfn_saved;
 	char protostr[256];
 	char path[256];
 	char fname_inc[256];
-	int is_oslib;
+	int is_osinc;
+	int is_cinc;
 	FILE *finc;
 	int line = 0;
 	int ret;
@@ -72,8 +92,8 @@ static int do_protostrs(FILE *fhdr, const char *fname)
 	hdrfn_saved = hdrfn;
 	hdrfn = fname;
 
-	is_oslib = strstr(fname, "stdc.hlist")
-		 || strstr(fname, "win32.hlist");
+	is_cinc = strstr(fname, "stdc.hlist") != NULL;
+	is_osinc = is_cinc || strstr(fname, "win32.hlist") != NULL;
 
 	while (fgets(protostr, sizeof(protostr), fhdr))
 	{
@@ -99,7 +119,7 @@ static int do_protostrs(FILE *fhdr, const char *fname)
 					fname_inc, line, finc_name);
 				continue;
 			}
-			ret = do_protostrs(finc, finc_name);
+			ret = do_protostrs(finc, finc_name, 1);
 			fclose(finc);
 			if (ret < 0)
 				break;
@@ -116,7 +136,12 @@ static int do_protostrs(FILE *fhdr, const char *fname)
 
 		hdrfline = line;
 
-		ret = b_pp_c_handler(protostr, hdrfn, is_oslib);
+		if (!strncmp(protostr, "struct", 6)
+		    && strchr(protostr, '{') != NULL)
+			ret = struct_handler(fhdr, protostr, &line);
+		else
+			ret = b_pp_c_handler(protostr, hdrfn,
+				is_include, is_osinc, is_cinc);
 		if (ret < 0)
 			break;
 	}
@@ -160,7 +185,6 @@ static const char *known_type_mod[] = {
 	"const",
 	"signed",
 	"unsigned",
-	"struct",
 	"enum",
 	"CONST",
 	"volatile",
@@ -173,12 +197,14 @@ static const char *known_ptr_types[] = {
 	"HACCEL",
 	"HANDLE",
 	"HBITMAP",
+	"HBRUSH",
 	"HCALL",
 	"HCURSOR",
 	"HDC",
 	"HFONT",
 	"HGDIOBJ",
 	"HGLOBAL",
+	"HHOOK",
 	"HICON",
 	"HINSTANCE",
 	"HIMC", // DWORD in mingw, ptr in wine..
@@ -190,21 +216,34 @@ static const char *known_ptr_types[] = {
 	"HRGN",
 	"HRSRC",
 	"HKEY",
+	"HKL",
 	"HMENU",
+	"HMONITOR",
 	"HWAVEOUT",
 	"HWND",
+	"PAPPBARDATA",
 	"PBYTE",
 	"PCRITICAL_SECTION",
+	"PDEVMODEA",
 	"PDWORD",
 	"PFILETIME",
 	"PLARGE_INTEGER",
+	"PHANDLE",
 	"PHKEY",
 	"PLONG",
 	"PMEMORY_BASIC_INFORMATION",
 	"PUINT",
+	"PULARGE_INTEGER",
+	"PULONG_PTR",
 	"PVOID",
 	"PCVOID",
 	"PWORD",
+	"REFCLSID",
+	"REFGUID",
+	"REFIID",
+	"SC_HANDLE",
+	"SERVICE_STATUS_HANDLE",
+	"HOOKPROC",
 	"DLGPROC",
 	"TIMERPROC",
 	"WNDENUMPROC",
@@ -214,13 +253,13 @@ static const char *known_ptr_types[] = {
 
 static const char *ignored_keywords[] = {
 	"extern",
+	"static",
 	"WINBASEAPI",
 	"WINUSERAPI",
 	"WINGDIAPI",
 	"WINADVAPI",
 };
 
-// returns ptr to char after type ends
 static int typecmp(const char *n, const char *t)
 {
 	for (; *t != 0; n++, t++) {
@@ -263,6 +302,14 @@ static int check_type(const char *name, struct parsed_type *type)
 	int i;
 
 	n = skip_type_mod(name);
+
+	if (!strncmp(n, "struct", 6) && my_isblank(n[6])) {
+		type->is_struct = 1;
+
+		n += 6;
+		while (my_isblank(*n))
+			n++;
+	}
 
 	for (i = 0; i < ARRAY_SIZE(known_ptr_types); i++) {
 		if (typecmp(n, known_ptr_types[i]))
@@ -328,6 +375,57 @@ static int check_struct_arg(struct parsed_proto_arg *arg)
 	return 0;
 }
 
+static int parse_protostr(char *protostr, struct parsed_proto *pp);
+
+static int parse_arg(char **p_, struct parsed_proto_arg *arg, int xarg)
+{
+	char buf[256];
+	char *p = *p_;
+	char *pe;
+	int ret;
+
+	arg->pp = calloc(1, sizeof(*arg->pp));
+	my_assert_not(arg->pp, NULL);
+	arg->pp->is_arg = 1;
+
+	pe = p;
+	while (1) {
+		pe = strpbrk(pe, ",()");
+		if (pe == NULL)
+			return -1;
+		if (*pe == ',' || *pe == ')')
+			break;
+		pe = strchr(pe, ')');
+		if (pe == NULL)
+			return -1;
+		pe++;
+	}
+
+	if (pe - p > sizeof(buf) - 1)
+		return -1;
+	memcpy(buf, p, pe - p);
+	buf[pe - p] = 0;
+
+	ret = parse_protostr(buf, arg->pp);
+	if (ret < 0)
+		return -1;
+
+	if (IS_START(arg->pp->name, "guess"))
+		arg->pp->is_guessed = 1;
+
+	// we don't use actual names right now...
+	snprintf(arg->pp->name, sizeof(arg->pp->name), "a%d", xarg);
+
+	if (!arg->type.is_struct)
+		// we'll treat it as void * for non-calls
+		arg->type.name = strdup("void *");
+	arg->type.is_ptr = 1;
+
+	p += ret;
+	*p_ = p;
+	return 0;
+}
+
 static int parse_protostr(char *protostr, struct parsed_proto *pp)
 {
 	struct parsed_proto_arg *arg;
@@ -335,8 +433,8 @@ static int parse_protostr(char *protostr, struct parsed_proto *pp)
 	char buf[256];
 	char cconv[32];
 	int is_retreg;
-	int xarg = 0;
 	char *p, *p1;
+	int xarg = 0;
 	int i, l;
 	int ret;
 
@@ -346,7 +444,18 @@ static int parse_protostr(char *protostr, struct parsed_proto *pp)
 		p = sskip(p + 2);
 	}
 
-	// strip unneeded stuff
+	// allow start of line comment
+	if (p[0] == '/' && p[1] == '*') {
+		p = strstr(p + 2, "*/");
+		if (p == NULL) {
+			printf("%s:%d: multiline comments unsupported\n",
+				hdrfn, hdrfline);
+			return -1;
+		}
+		p = sskip(p + 2);
+	}
+
+	// we need remaining hints in comments, so strip / *
 	for (p1 = p; p1[0] != 0 && p1[1] != 0; p1++) {
 		if ((p1[0] == '/' && p1[1] == '*')
 		 || (p1[0] == '*' && p1[1] == '/'))
@@ -362,6 +471,11 @@ static int parse_protostr(char *protostr, struct parsed_proto *pp)
 		l = strlen(ignored_keywords[i]);
 		if (!strncmp(p, ignored_keywords[i], l) && my_isblank(p[l]))
 			p = sskip(p + l + 1);
+	}
+
+	if (IS_START(p, "DECL_IMPORT ")) {
+		pp->is_import = 1;
+		p = sskip(p + 12);
 	}
 
 	ret = check_type(p, &pp->ret_type);
@@ -380,8 +494,8 @@ static int parse_protostr(char *protostr, struct parsed_proto *pp)
 	if (!strchr(p, ')')) {
 		p = next_idt(buf, sizeof(buf), p);
 		p = sskip(p);
-		if (buf[0] == 0) {
-			printf("%s:%d:%zd: var name missing\n",
+		if (!pp->is_arg && buf[0] == 0) {
+			printf("%s:%d:%zd: var name is missing\n",
 				hdrfn, hdrfline, (p - protostr) + 1);
 			return -1;
 		}
@@ -427,7 +541,7 @@ static int parse_protostr(char *protostr, struct parsed_proto *pp)
 		pp->is_stdcall = 0; // custom
 		pp->is_userstack = 1;
 	}
-	else if (IS(cconv, "WINAPI"))
+	else if (IS(cconv, "WINAPI") || IS(cconv, "PASCAL"))
 		pp->is_stdcall = 1;
 	else {
 		printf("%s:%d:%zd: unhandled cconv: '%s'\n",
@@ -530,6 +644,12 @@ static int parse_protostr(char *protostr, struct parsed_proto *pp)
 			return -1;
 		}
 
+		if (xarg >= ARRAY_SIZE(pp->arg)) {
+			printf("%s:%d:%zd: too many args\n",
+				hdrfn, hdrfline, (p - protostr) + 1);
+			return -1;
+		}
+
 		arg = &pp->arg[xarg];
 		xarg++;
 
@@ -542,24 +662,15 @@ static int parse_protostr(char *protostr, struct parsed_proto *pp)
 		}
 		p = sskip(p + ret);
 
-		if (*p == '(') {
-			// func ptr
-			arg->fptr = calloc(1, sizeof(*arg->fptr));
-			ret = parse_protostr(p1, arg->fptr);
+		if (*p == '(' || arg->type.is_struct) {
+			// func ptr or struct
+			ret = parse_arg(&p1, arg, xarg);
 			if (ret < 0) {
 				printf("%s:%d:%zd: funcarg parse failed\n",
 					hdrfn, hdrfline, p1 - protostr);
 				return -1;
 			}
-			arg->fptr->is_arg = 1;
-			// we don't use actual names right now..
-			snprintf(arg->fptr->name,
-				sizeof(arg->fptr->name), "a%d", xarg);
-			// we'll treat it as void * for non-calls
-			arg->type.name = strdup("void *");
-			arg->type.is_ptr = 1;
-
-			p = p1 + ret;
+			p = p1;
 		}
 
 		p = next_idt(buf, sizeof(buf), p);
@@ -583,14 +694,22 @@ static int parse_protostr(char *protostr, struct parsed_proto *pp)
 			pp->has_retreg |= is_retreg;
 		}
 
-		if (strstr(arg->type.name, "int64")
-		    || IS(arg->type.name, "double"))
+		if (IS(arg->type.name, "float")
+		      || IS(arg->type.name, "double"))
 		{
+			arg->type.is_float = 1;
+		}
+
+		if (!arg->type.is_ptr && (strstr(arg->type.name, "int64")
+		      || IS(arg->type.name, "double")))
+		{
+			arg->type.is_64bit = 1;
 			// hack..
-			free(arg->type.name);
-			arg->type.name = strdup("int");
 			pp_copy_arg(&pp->arg[xarg], arg);
+			arg = &pp->arg[xarg];
 			xarg++;
+			free(arg->type.name);
+			arg->type.name = strdup("dummy");
 		}
 
 		ret = check_struct_arg(arg);
@@ -657,11 +776,83 @@ static int pp_name_cmp(const void *p1, const void *p2)
 	return strcmp(pp1->name, pp2->name);
 }
 
+static int ps_name_cmp(const void *p1, const void *p2)
+{
+	const struct parsed_struct *ps1 = p1, *ps2 = p2;
+	return strcmp(ps1->name, ps2->name);
+}
+
+// parsed struct cache
+static struct parsed_struct *ps_cache;
+static int ps_cache_size;
+static int ps_cache_alloc;
+
+static int struct_handler(FILE *fhdr, char *proto, int *line)
+{
+	struct parsed_struct *ps;
+	char lstr[256], *p;
+	int offset = 0;
+	int m = 0;
+	int ret;
+
+	if (ps_cache_size >= ps_cache_alloc) {
+		ps_cache_alloc = ps_cache_alloc * 2 + 64;
+		ps_cache = realloc(ps_cache, ps_cache_alloc
+				* sizeof(ps_cache[0]));
+		my_assert_not(ps_cache, NULL);
+		memset(ps_cache + ps_cache_size, 0,
+			(ps_cache_alloc - ps_cache_size)
+			 * sizeof(ps_cache[0]));
+	}
+
+	ps = &ps_cache[ps_cache_size++];
+	ret = sscanf(proto, "struct %255s {", ps->name);
+	if (ret != 1) {
+		printf("%s:%d: struct parse failed\n", hdrfn, *line);
+		return -1;
+	}
+
+	while (fgets(lstr, sizeof(lstr), fhdr))
+	{
+		(*line)++;
+
+		p = sskip(lstr);
+		if (p[0] == '/' && p[1] == '/')
+			continue;
+		if (p[0] == '}')
+			break;
+
+		if (m >= ARRAY_SIZE(ps->members)) {
+			printf("%s:%d: too many struct members\n",
+				hdrfn, *line);
+			return -1;
+		}
+
+		hdrfline = *line;
+		ret = parse_protostr(p, &ps->members[m].pp);
+		if (ret < 0) {
+			printf("%s:%d: struct member #%d/%02x "
+				"doesn't parse\n", hdrfn, *line,
+				m, offset);
+			return -1;
+		}
+		ps->members[m].offset = offset;
+		offset += 4;
+		m++;
+	}
+
+	ps->member_count = m;
+
+	return 0;
+}
+
+// parsed proto cache
 static struct parsed_proto *pp_cache;
 static int pp_cache_size;
 static int pp_cache_alloc;
 
-static int b_pp_c_handler(char *proto, const char *fname, int is_oslib)
+static int b_pp_c_handler(char *proto, const char *fname,
+	int is_include, int is_osinc, int is_cinc)
 {
 	int ret;
 
@@ -679,12 +870,14 @@ static int b_pp_c_handler(char *proto, const char *fname, int is_oslib)
 	if (ret < 0)
 		return -1;
 
-	pp_cache[pp_cache_size].is_oslib = is_oslib;
+	pp_cache[pp_cache_size].is_include = is_include;
+	pp_cache[pp_cache_size].is_osinc = is_osinc;
+	pp_cache[pp_cache_size].is_cinc = is_cinc;
 	pp_cache_size++;
 	return 0;
 }
 
-static void build_pp_cache(FILE *fhdr)
+static void build_caches(FILE *fhdr)
 {
 	long pos;
 	int ret;
@@ -692,11 +885,12 @@ static void build_pp_cache(FILE *fhdr)
 	pos = ftell(fhdr);
 	rewind(fhdr);
 
-	ret = do_protostrs(fhdr, hdrfn);
+	ret = do_protostrs(fhdr, hdrfn, 0);
 	if (ret < 0)
 		exit(1);
 
 	qsort(pp_cache, pp_cache_size, sizeof(pp_cache[0]), pp_name_cmp);
+	qsort(ps_cache, ps_cache_size, sizeof(ps_cache[0]), ps_name_cmp);
 	fseek(fhdr, pos, SEEK_SET);
 }
 
@@ -708,9 +902,10 @@ static const struct parsed_proto *proto_parse(FILE *fhdr, const char *sym,
 	char *p;
 
 	if (pp_cache == NULL)
-		build_pp_cache(fhdr);
+		build_caches(fhdr);
 
-	if (sym[0] == '_') // && strncmp(fname, "stdc", 4) == 0)
+	// ugh...
+	if (sym[0] == '_' && !IS_START(sym, "__W"))
 		sym++;
 
 	strcpy(pp_search.name, sym);
@@ -726,6 +921,41 @@ static const struct parsed_proto *proto_parse(FILE *fhdr, const char *sym,
 	return pp_ret;
 }
 
+static const struct parsed_proto *proto_lookup_struct(FILE *fhdr,
+	const char *type, int offset)
+{
+	struct parsed_struct ps_search, *ps;
+	int m;
+
+	if (pp_cache == NULL)
+		build_caches(fhdr);
+	if (ps_cache_size == 0)
+		return NULL;
+
+	while (my_isblank(*type))
+		type++;
+	if (!strncmp(type, "struct", 6) && my_isblank(type[6]))
+		type += 7;
+
+	if (sscanf(type, "%255s", ps_search.name) != 1)
+		return NULL;
+
+	ps = bsearch(&ps_search, ps_cache, ps_cache_size,
+			sizeof(ps_cache[0]), ps_name_cmp);
+	if (ps == NULL) {
+		printf("%s: struct '%s' is missing\n",
+			hdrfn, ps_search.name);
+		return NULL;
+	}
+
+	for (m = 0; m < ps->member_count; m++) {
+		if (ps->members[m].offset == offset)
+			return &ps->members[m].pp;
+	}
+
+	return NULL;
+}
+
 static void pp_copy_arg(struct parsed_proto_arg *d,
 	const struct parsed_proto_arg *s)
 {
@@ -739,10 +969,10 @@ static void pp_copy_arg(struct parsed_proto_arg *d,
 		d->type.name = strdup(s->type.name);
 		my_assert_not(d->type.name, NULL);
 	}
-	if (s->fptr != NULL) {
-		d->fptr = malloc(sizeof(*d->fptr));
-		my_assert_not(d->fptr, NULL);
-		memcpy(d->fptr, s->fptr, sizeof(*d->fptr));
+	if (s->pp != NULL) {
+		d->pp = malloc(sizeof(*d->pp));
+		my_assert_not(d->pp, NULL);
+		memcpy(d->pp, s->pp, sizeof(*d->pp));
 	}
 }
 
@@ -772,18 +1002,39 @@ static inline int pp_cmp_func(const struct parsed_proto *pp1,
 
   if (pp1->argc != pp2->argc || pp1->argc_reg != pp2->argc_reg)
     return 1;
-  else {
-    for (i = 0; i < pp1->argc; i++) {
-      if ((pp1->arg[i].reg != NULL) != (pp2->arg[i].reg != NULL))
-        return 1;
+  if (pp1->is_stdcall != pp2->is_stdcall)
+    return 1;
 
-      if ((pp1->arg[i].reg != NULL)
-        && !IS(pp1->arg[i].reg, pp2->arg[i].reg))
-      {
-        return 1;
-      }
+  // because of poor void return detection, return is not
+  // checked for now to avoid heaps of false positives
+
+  for (i = 0; i < pp1->argc; i++) {
+    if ((pp1->arg[i].reg != NULL) != (pp2->arg[i].reg != NULL))
+      return 1;
+
+    if ((pp1->arg[i].reg != NULL)
+      && !IS(pp1->arg[i].reg, pp2->arg[i].reg))
+    {
+      return 1;
     }
   }
+
+  return 0;
+}
+
+static inline int pp_compatible_func(
+  const struct parsed_proto *pp_site,
+  const struct parsed_proto *pp_callee)
+{
+  if (pp_cmp_func(pp_site, pp_callee) == 0)
+    return 1;
+
+  if (pp_site->argc_stack == 0 && pp_site->is_fastcall
+      && pp_callee->argc_stack == 0
+      && (pp_callee->is_fastcall || pp_callee->argc_reg == 0)
+      && pp_site->argc_reg > pp_callee->argc_reg)
+    /* fascall compatible callee doesn't use all args -> ok */
+    return 1;
 
   return 0;
 }
@@ -815,14 +1066,14 @@ static inline void proto_release(struct parsed_proto *pp)
 	int i;
 
 	for (i = 0; i < pp->argc; i++) {
-		if (pp->arg[i].reg != NULL)
-			free(pp->arg[i].reg);
-		if (pp->arg[i].type.name != NULL)
-			free(pp->arg[i].type.name);
-		if (pp->arg[i].fptr != NULL)
-			free(pp->arg[i].fptr);
+		free(pp->arg[i].reg);
+		free(pp->arg[i].type.name);
+		free(pp->arg[i].pp);
+		free(pp->arg[i].push_refs);
 	}
 	if (pp->ret_type.name != NULL)
 		free(pp->ret_type.name);
 	free(pp);
+
+	(void)proto_lookup_struct;
 }

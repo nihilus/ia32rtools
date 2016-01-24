@@ -12,10 +12,7 @@
 
 #include "my_assert.h"
 #include "my_str.h"
-
-#define ARRAY_SIZE(x) (sizeof(x) / sizeof(x[0]))
-#define IS(w, y) !strcmp(w, y)
-#define IS_START(w, y) !strncmp(w, y, strlen(y))
+#include "common.h"
 
 #include "protoparse.h"
 
@@ -23,7 +20,7 @@ int main(int argc, char *argv[])
 {
   const struct parsed_proto *pp;
   FILE *fout, *fhdr;
-  char basename[256];
+  char basename[256] = { 0, };
   char line[256];
   char fmt[256];
   char word[256];
@@ -37,12 +34,14 @@ int main(int argc, char *argv[])
   for (arg = 1; arg < argc; arg++) {
     if (IS(argv[arg], "-n"))
       noname = 1;
+    else if (IS(argv[arg], "-b") && arg < argc - 1)
+      snprintf(basename, sizeof(basename), "%s", argv[++arg]);
     else
       break;
   }
 
   if (argc != arg + 2) {
-    printf("usage:\n%s [-n] <.h> <.def>\n", argv[0]);
+    printf("usage:\n%s [-n] [-b <basename>] <.h> <.def>\n", argv[0]);
     return 1;
   }
 
@@ -53,15 +52,17 @@ int main(int argc, char *argv[])
   fout = fopen(argv[arg++], "w");
   my_assert_not(fout, NULL);
 
-  p = strrchr(hdrfn, '.');
-  my_assert_not(p, NULL);
-  p2 = strrchr(hdrfn, '/');
-  if (p2++ == NULL)
-    p2 = hdrfn;
-  l = p - p2;
-  my_assert((unsigned int)l < 256, 1);
-  memcpy(basename, p2, l);
-  basename[l] = 0;
+  if (basename[0] == 0) {
+    p = strrchr(hdrfn, '.');
+    my_assert_not(p, NULL);
+    p2 = strrchr(hdrfn, '/');
+    if (p2++ == NULL)
+      p2 = hdrfn;
+    l = p - p2;
+    my_assert((unsigned int)l < 256, 1);
+    memcpy(basename, p2, l);
+    basename[l] = 0;
+  }
 
   snprintf(fmt, sizeof(fmt), "%s_%%d", basename);
 
@@ -74,7 +75,7 @@ int main(int argc, char *argv[])
     if (*p == 0)
       continue;
 
-    if (IS(p, "//"))
+    if (IS_START(p, "//"))
       continue;
 
     ret = 0;
@@ -94,9 +95,11 @@ int main(int argc, char *argv[])
     if (pp == NULL)
       return 1;
 
-    fprintf(fout, "  %s", word);
+    fputc(' ', fout);
+    fputc(pp->is_fastcall ? '@' : ' ', fout);
+    fprintf(fout, "%s", word);
     if (pp->is_stdcall)
-      fprintf(fout, "@%-2d", pp->argc_stack * 4);
+      fprintf(fout, "@%-2d", pp->argc * 4);
     else
       fprintf(fout, "   ");
     fprintf(fout, " @%d", ord);

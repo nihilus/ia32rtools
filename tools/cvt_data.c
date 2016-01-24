@@ -1,6 +1,6 @@
 /*
  * ia32rtools
- * (C) notaz, 2013,2014
+ * (C) notaz, 2013-2015
  *
  * This work is licensed under the terms of 3-clause BSD license.
  * See COPYING file in the top-level directory.
@@ -10,13 +10,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
+#include <inttypes.h>
 
 #include "my_assert.h"
 #include "my_str.h"
-
-#define ARRAY_SIZE(x) (sizeof(x) / sizeof(x[0]))
-#define IS(w, y) !strcmp(w, y)
-#define IS_START(w, y) !strncmp(w, y, strlen(y))
+#include "common.h"
 
 #include "protoparse.h"
 
@@ -87,7 +86,7 @@ static void next_section(FILE *fasm, char *name)
 
   name[0] = 0;
 
-  while (fgets(line, sizeof(line), fasm))
+  while (my_fgets(line, sizeof(line), fasm))
   {
     wordc = 0;
     asmln++;
@@ -96,14 +95,8 @@ static void next_section(FILE *fasm, char *name)
     if (*p == 0)
       continue;
 
-    if (*p == ';') {
-      while (strlen(line) == sizeof(line) - 1) {
-        // one of those long comment lines..
-        if (!fgets(line, sizeof(line), fasm))
-          break;
-      }
+    if (*p == ';')
       continue;
-    }
 
     for (wordc = 0; wordc < ARRAY_SIZE(words); wordc++) {
       p = sskip(next_word(words[wordc], sizeof(words[0]), p));
@@ -200,7 +193,7 @@ static char *escape_string(char *s)
 
   for (; *s != 0; s++) {
     if (*s == '"') {
-      strcpy(t, "\\22");
+      strcpy(t, "\\\"");
       t += strlen(t);
       continue;
     }
@@ -211,7 +204,9 @@ static char *escape_string(char *s)
     }
     *t++ = *s;
   }
-  *t = *s;
+  *t++ = *s;
+  if (t - buf > sizeof(buf))
+    aerr("string is too long\n");
   return strcpy(s, buf);
 }
 
@@ -244,7 +239,7 @@ static void sprint_pp_short(const struct parsed_proto *pp, char *buf,
 }
 
 static const struct parsed_proto *check_var(FILE *fhdr,
-  const char *sym, const char *varname)
+  const char *sym, const char *varname, int is_export)
 {
   const struct parsed_proto *pp, *pp_sym;
   char fp_sym[256], fp_var[256], *p;
@@ -257,6 +252,8 @@ static const struct parsed_proto *check_var(FILE *fhdr,
     return NULL;
   }
 
+  if (is_export)
+    return NULL;
   if (!pp->is_func && !pp->is_fptr)
     return NULL;
 
@@ -309,10 +306,10 @@ check_sym:
       return pp;
   }
 
-  if (pp_cmp_func(pp, pp_sym)) {
+  if (!pp_compatible_func(pp_sym, pp)) {
     pp_print(fp_sym, sizeof(fp_sym), pp_sym);
-    anote("var: %s\n", fp_var);
-    anote("sym: %s\n", fp_sym);
+    anote("entry: %s\n", fp_var);
+    anote("label: %s\n", fp_sym);
     awarn("^ mismatch\n");
   }
 
@@ -381,9 +378,14 @@ static int is_unwanted_sym(const char *sym)
 
 int main(int argc, char *argv[])
 {
-  FILE *fout, *fasm, *fhdr, *frlist;
+  FILE *fout, *fasm, *fhdr = NULL, *frlist;
   const struct parsed_proto *pp;
   int no_decorations = 0;
+  int header_mode = 0;
+  int maybe_func_table;
+  int in_export_table;
+  int rm_labels_lines;
+  int is_zero_val;
   char comment_char = '#';
   char words[20][256];
   char word[256];
@@ -391,6 +393,7 @@ int main(int argc, char *argv[])
   char last_sym[32];
   unsigned long val;
   unsigned long cnt;
+  uint64_t val64;
   const char *sym;
   enum dx_type type;
   char **pub_syms;
@@ -399,6 +402,7 @@ int main(int argc, char *argv[])
   char **rlist;
   int rlist_cnt = 0;
   int rlist_alloc;
+  int is_ro = 0;
   int is_label;
   int is_bss;
   int wordc;
@@ -412,8 +416,9 @@ int main(int argc, char *argv[])
 
   if (argc < 4) {
     // -nd: no symbol decorations
-    printf("usage:\n%s [-nd] [-i] [-a] <.s> <.asm> <hdrf> [rlist]*\n",
-      argv[0]);
+    printf("usage:\n%s [-nd] [-i] [-a] <.s> <.asm> <hdrf> [rlist]*\n"
+           "%s -hdr <.h> <.asm>\n",
+      argv[0], argv[0]);
     return 1;
   }
 
@@ -426,6 +431,8 @@ int main(int argc, char *argv[])
       comment_char = '@';
       g_arm_mode = 1;
     }
+    else if (IS(argv[arg], "-hdr"))
+      header_mode = 1;
     else
       break;
   }
@@ -436,9 +443,11 @@ int main(int argc, char *argv[])
   fasm = fopen(asmfn, "r");
   my_assert_not(fasm, NULL);
 
-  hdrfn = argv[arg++];
-  fhdr = fopen(hdrfn, "r");
-  my_assert_not(fhdr, NULL);
+  if (!header_mode) {
+    hdrfn = argv[arg++];
+    fhdr = fopen(hdrfn, "r");
+    my_assert_not(fhdr, NULL);
+  }
 
   fout = fopen(argv[arg_out], "w");
   my_assert_not(fout, NULL);
@@ -455,9 +464,9 @@ int main(int argc, char *argv[])
     frlist = fopen(argv[arg], "r");
     my_assert_not(frlist, NULL);
 
-    while (fgets(line, sizeof(line), frlist)) {
+    while (my_fgets(line, sizeof(line), frlist)) {
       p = sskip(line);
-      if (*p == 0 || *p == ';')
+      if (*p == 0 || *p == ';' || *p == '#')
         continue;
 
       p = next_word(words[0], sizeof(words[0]), p);
@@ -482,26 +491,38 @@ int main(int argc, char *argv[])
   qsort(unwanted_syms, ARRAY_SIZE(unwanted_syms),
     sizeof(unwanted_syms[0]), cmpstringp);
 
-  last_sym[0] = 0;
-
   while (1) {
+    last_sym[0] = 0;
+    g_func_sym_pp = NULL;
+    maybe_func_table = 0;
+    in_export_table = 0;
+    rm_labels_lines = 0;
+
     next_section(fasm, line);
     if (feof(fasm))
       break;
     if (IS(line + 1, "text"))
       continue;
 
-    if (IS(line + 1, "rdata"))
-      fprintf(fout, "\n.section .rodata\n");
-    else if (IS(line + 1, "data"))
-      fprintf(fout, "\n.data\n");
+    if (IS(line + 1, "rdata")) {
+      is_ro = 1;
+      if (!header_mode)
+        fprintf(fout, "\n.section .rodata\n");
+    }
+    else if (IS(line + 1, "data")) {
+      is_ro = 0;
+      if (!header_mode)
+        fprintf(fout, "\n.data\n");
+    }
     else
       aerr("unhandled section: '%s'\n", line);
 
-    fprintf(fout, ".align %d\n", align_value(4));
+    if (!header_mode)
+      fprintf(fout, ".align %d\n", align_value(4));
 
-    while (fgets(line, sizeof(line), fasm))
+    while (my_fgets(line, sizeof(line), fasm))
     {
+      is_zero_val = 0;
       sym = NULL;
       asmln++;
 
@@ -513,9 +534,13 @@ int main(int argc, char *argv[])
         if (IS_START(p, ";org") && sscanf(p + 5, "%Xh", &i) == 1) {
           // ;org is only seen at section start, so assume . addr 0
           i &= 0xfff;
-          if (i != 0)
+          if (i != 0 && !header_mode)
             fprintf(fout, "\t\t  .skip 0x%x\n", i);
         }
+        else if (IS_START(p, "; Export Address"))
+          in_export_table = 1;
+        else if (IS_START(p, "; Export"))
+          in_export_table = 0;
         continue;
       }
 
@@ -532,8 +557,10 @@ int main(int argc, char *argv[])
 
       if (*p == ';') {
         p = sskip(p + 1);
-        if (IS_START(p, "sctclrtype"))
+        if (IS_START(p, "sctclrtype")) {
+          maybe_func_table = 0;
           g_func_sym_pp = NULL;
+        }
       }
 
       if (wordc == 2 && IS(words[1], "ends"))
@@ -548,9 +575,17 @@ int main(int argc, char *argv[])
         continue;
 
       if (IS(words[0], "align")) {
-        val = parse_number(words[1]);
+        if (header_mode)
+          continue;
+
+        val = parse_number(words[1], 0);
         fprintf(fout, "\t\t  .align %d", align_value(val));
         goto fin;
+      }
+
+      if (IS(words[0], "public")) {
+        // skip, sym should appear in header anyway
+        continue;
       }
 
       w = 1;
@@ -563,8 +598,49 @@ int main(int argc, char *argv[])
       if (type == DXT_UNSPEC)
         aerr("unhandled decl: '%s %s'\n", words[0], words[1]);
 
-      if (sym != NULL) {
+      if (sym != NULL)
+      {
+        if (header_mode) {
+          int is_str = 0;
+
+          fprintf(fout, "extern ");
+          if (is_ro)
+            fprintf(fout, "const ");
+
+          switch (type) {
+          case DXT_BYTE:
+            for (i = w; i < wordc; i++)
+              if (words[i][0] == '\'')
+                is_str = 1;
+            if (is_str)
+              fprintf(fout, "char     %s[];\n", sym);
+            else
+              fprintf(fout, "uint8_t  %s;\n", sym);
+            break;
+
+          case DXT_WORD:
+            fprintf(fout, "uint16_t %s;\n", sym);
+            break;
+
+          case DXT_DWORD:
+            fprintf(fout, "uint32_t %s;\n", sym);
+            break;
+
+          default:
+            fprintf(fout, "_UNKNOWN %s;\n", sym);
+            break;
+          }
+
+          continue;
+        }
+
         snprintf(last_sym, sizeof(last_sym), "%s", sym);
+        maybe_func_table = type == DXT_DWORD;
+
+        if (IS_START(sym, "__IMPORT_DESCRIPTOR_")) {
+          rm_labels_lines = 5;
+          maybe_func_table = 0;
+        }
 
         pp = proto_parse(fhdr, sym, 1);
         if (pp != NULL) {
@@ -593,6 +669,9 @@ int main(int argc, char *argv[])
           fprintf(fout, " ");
       }
       else {
+        if (header_mode)
+          continue;
+
         fprintf(fout, "\t\t  ");
       }
 
@@ -638,10 +717,12 @@ int main(int argc, char *argv[])
             fprintf(fout, "%s", escape_string(word));
           }
           else {
-            val = parse_number(words[w]);
+            val = parse_number(words[w], 0);
             if (val & ~0xff)
               aerr("bad string trailing byte?\n");
-            fprintf(fout, "\\x%02lx", val);
+            // unfortunately \xHH is unusable - gas interprets
+            // things like \x27b as 0x7b, so have to use octal here
+            fprintf(fout, "\\%03lo", val);
           }
         }
         fprintf(fout, "\"");
@@ -650,7 +731,7 @@ int main(int argc, char *argv[])
 
       if (w == wordc - 2) {
         if (IS_START(words[w + 1], "dup(")) {
-          cnt = parse_number(words[w]);
+          cnt = parse_number(words[w], 0);
           p = words[w + 1] + 4;
           p2 = strchr(p, ')');
           if (p2 == NULL)
@@ -660,7 +741,7 @@ int main(int argc, char *argv[])
 
           val = 0;
           if (!IS(word, "?"))
-            val = parse_number(word);
+            val = parse_number(word, 0);
 
           fprintf(fout, ".fill 0x%02lx,%d,0x%02lx",
             cnt, type_size(type), val);
@@ -725,6 +806,7 @@ int main(int argc, char *argv[])
           p = words[w];
           if (IS_START(p, "loc_") || IS_START(p, "__imp")
              || strchr(p, '?') || strchr(p, '@')
+             || rm_labels_lines > 0
              || bsearch(&p, rlist, rlist_cnt, sizeof(rlist[0]),
                   cmpstringp))
           {
@@ -732,7 +814,9 @@ int main(int argc, char *argv[])
             snprintf(g_comment, sizeof(g_comment), "%s", p);
           }
           else {
-            pp = check_var(fhdr, sym, p);
+            const char *f_sym = maybe_func_table ? last_sym : NULL;
+
+            pp = check_var(fhdr, f_sym, p, in_export_table);
             if (pp == NULL) {
               fprintf(fout, "%s%s",
                 (no_decorations || p[0] == '_') ? "" : "_", p);
@@ -746,17 +830,25 @@ int main(int argc, char *argv[])
           }
         }
         else {
-          val = parse_number(words[w]);
-          if (val < 10)
-            fprintf(fout, "%ld", val);
+          val64 = parse_number(words[w], 1);
+          if (val64 < 10)
+            fprintf(fout, "%d", (int)val64);
           else
-            fprintf(fout, "0x%lx", val);
+            fprintf(fout, "0x%" PRIx64, val64);
+
+          is_zero_val = val64 == 0;
         }
 
         first = 0;
       }
 
 fin:
+      if (!is_zero_val)
+        maybe_func_table = 0;
+
+      if (rm_labels_lines > 0)
+        rm_labels_lines--;
+
       if (g_comment[0] != 0) {
         fprintf(fout, "\t\t%c %s", comment_char, g_comment);
         g_comment[0] = 0;
@@ -774,7 +866,8 @@ fin:
 
   fclose(fout);
   fclose(fasm);
-  fclose(fhdr);
+  if (fhdr != NULL)
+    fclose(fhdr);
 
   return 0;
 }

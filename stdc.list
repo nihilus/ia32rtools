@@ -17,15 +17,22 @@ _strncmp
 _strpbrk
 _atol
 _getenv
+_isalnum
 _isalpha
+_iscntrl
 _isdigit
-_isspace
+_isgraph
+_islower
 _isprint
+_ispunct
+_isspace
+_isupper
+_isxdigit
 _tolower
 #_strncnt
 #_findenv
-#__strdup
-#__mbschr
+__strdup
+__mbschr
 _strchr
 _strrchr
 _strtoxl
@@ -34,7 +41,6 @@ _strtoul
 _srand
 _rand
 _time
-_siglookup
 _signal
 _strtok
 __wcsicmp
@@ -42,6 +48,8 @@ __ismbcspace
 __mbsrchr
 _shortsort
 _qsort
+_system
+_bsearch
 __mbspbrk
 __mbsstr
 _localtime
@@ -55,13 +63,15 @@ _fopen
 _fclose
 _setvbuf
 _fread
+__fread_nolock
 _fwrite
+__fwrite_nolock
 _fseek
 _fgetc
+_fgets
+_fputs
 __filbuf
 __mbsicmp
-__beginthreadex
-__endthreadex
 __onexit
 _atexit
 __stricmp
@@ -70,6 +80,8 @@ __strnicmp
 __strupr
 _sprintf
 _vsprintf
+_fprintf
+_printf
 __strlwr
 __fullpath
 _toupper
@@ -77,6 +89,7 @@ _wcslen
 _wcstombs
 _setlocale
 __setmbcp
+__getmbcp
 __lseek
 __write
 __isatty
@@ -90,14 +103,52 @@ _mbtowc
 _ungetc
 __strcmpi
 __splitpath
+_abort
+_raise
+__snprintf
+_atoi
+_abs
+_labs
+
+__findfirst
+__findnext
+__findclose
+__chdir
+__getcwd
+__mkdir
+__mktemp
+__rmdir
+__chmod
+_remove
+_rename
 
 # float
 __control87
 __controlfp
 
-# math
-# __ftol2 - todo
+# msvcrt math
+# __ftol - x87 state
+# __ftol2 - x87 state
 _ceil
+_floor
+_sqrt
+_pow
+__rotl
+__rotr
+
+# msvcrt
+__beginthread
+__endthread
+__beginthreadex
+__endthreadex
+__atoi64
+__i64toa
+__ui64toa
+__lock
+__unlock
+__isctype
+__CIpow
 
 # not in mingw
 _memcpy_0
+_siglookup
